@@ -1,0 +1,19 @@
+{
+  "order": {
+    "sheet_index": 1,
+    "first_data_row": 2,
+    "internal_code_column": "B",
+    "supplier_article_column": "C",
+    "order_number_label": "Заказ №",
+    "order_number_label_column": "B",
+    "order_number_value_column": "C"
+  },
+  "upd": {
+    "sheet_index": 1,
+    "first_data_row": 17,
+    "article_column": "B",
+    "basis_label": "Основание передачи",
+    "order_number_column": "T",
+    "order_number_row_offset": -1
+  }
+}
