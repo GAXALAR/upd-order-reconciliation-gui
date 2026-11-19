@@ -36,6 +36,31 @@ class UPDReconcilerApp:
         self.log_area.see(tk.END)
         self.root.update()
 
+    @staticmethod
+    def normalize_article(value):
+        if value is None:
+            return ""
+        text = str(value).strip()
+        if text.endswith(".0"):
+            try:
+                numeric = float(text)
+                if numeric.is_integer():
+                    text = str(int(numeric))
+            except (TypeError, ValueError, OverflowError):
+                pass
+        return text
+
+    @staticmethod
+    def unique_output_path(source):
+        candidate = source.with_name(f"{source.stem}_reconciled{source.suffix}")
+        counter = 1
+        while candidate.exists():
+            candidate = source.with_name(
+                f"{source.stem}_reconciled_{counter}{source.suffix}"
+            )
+            counter += 1
+        return candidate
+
     def load_order(self):
         file = filedialog.askopenfilename(filetypes=[("Excel Files", "*.xlsx")])
         if file:
@@ -81,10 +106,9 @@ class UPDReconcilerApp:
             duplicate_articles = set()
             order_number = ""
 
-            for row in ws_order.iter_rows(min_row=1, max_row=ws_order.max_row):
-                # Индексы 1 и 2 соответствуют колонкам B и C
-                cell_b = str(row[1].value or "").strip()
-                cell_c = str(row[2].value or "").strip()
+            for row_idx in range(1, ws_order.max_row + 1):
+                cell_b = self.normalize_article(ws_order.cell(row=row_idx, column=2).value)
+                cell_c = self.normalize_article(ws_order.cell(row=row_idx, column=3).value)
 
                 if cell_b and cell_c:
                     if cell_c in art_map and art_map[cell_c] != cell_b:
@@ -93,11 +117,18 @@ class UPDReconcilerApp:
                         art_map[cell_c] = cell_b
 
                 if "Заказ №" in cell_b:
-                    order_number = str(row[2].value or "").strip()
+                    order_number = cell_c
 
             for article in duplicate_articles:
                 art_map.pop(article, None)
                 self.log(f"[ДУБЛИКАТ] Артикул '{article}' имеет неоднозначное соответствие.")
+
+            if not order_number:
+                messagebox.showerror(
+                    "Ошибка",
+                    "Номер заказа не найден в файле. Обработка остановлена."
+                )
+                return
 
             self.log(f"Загружено позиций: {len(art_map)}. Номер заказа: {order_number}")
 
@@ -109,7 +140,9 @@ class UPDReconcilerApp:
 
             # Замена артикулов начиная с 17 строки (Колонка B - это индекс 2 в openpyxl)
             for row_idx in range(17, ws_upd.max_row + 1):
-                current_art = str(ws_upd.cell(row=row_idx, column=2).value or "").strip()
+                current_art = self.normalize_article(
+                    ws_upd.cell(row=row_idx, column=2).value
+                )
                 if not current_art:
                     continue
 
@@ -137,19 +170,34 @@ class UPDReconcilerApp:
                 ws_upd.cell(row=row_idx, column=2).value = new_article
                 self.log(f"[OK] Строка {row_idx}: заменён артикул '{current_art}' на '{new_article}'")
 
-            # Поиск "Основание передачи" и вставка номера заказа
-            for row in ws_upd.iter_rows(min_row=1, max_row=ws_upd.max_row):
+            # Поиск "Основание передачи": совпадение должно быть единственным
+            basis_matches = []
+            for row in ws_upd.iter_rows():
                 for cell in row:
                     if str(cell.value or "").strip() == "Основание передачи":
-                        target_row = cell.row - 1
-                        if target_row > 0:
-                            # Колонка T - это 20
-                            ws_upd.cell(row=target_row, column=20).value = order_number
-                            self.log(f"Номер заказа успешно вписан в строку {target_row}.")
-                        break
+                        basis_matches.append(cell)
+
+            if not basis_matches:
+                messagebox.showerror(
+                    "Ошибка",
+                    'Поле "Основание передачи" не найдено. Обработка остановлена.'
+                )
+                return
+            if len(basis_matches) > 1:
+                messagebox.showerror(
+                    "Ошибка",
+                    f'Найдено несколько полей "Основание передачи" ({len(basis_matches)}). '
+                    "Обработка остановлена."
+                )
+                return
+
+            target_row = basis_matches[0].row - 1
+            if target_row > 0:
+                ws_upd.cell(row=target_row, column=20).value = order_number
+                self.log(f"Номер заказа успешно вписан в строку {target_row}.")
 
             # 3. Сохранение
-            output_path = upd_path.with_name(f"{upd_path.stem}_reconciled{upd_path.suffix}")
+            output_path = self.unique_output_path(upd_path)
             wb_upd.save(output_path)
             self.log("--- Успешно завершено! ---")
             messagebox.showinfo("Успех", f"Обработка завершена!\nФайл сохранён:\n{output_path}")

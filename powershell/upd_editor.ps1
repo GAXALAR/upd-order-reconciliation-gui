@@ -5,6 +5,19 @@ Add-Type -AssemblyName System.Drawing
 $global:pathOrder = ""
 $global:pathUpd = ""
 
+function Get-NormalizedArticle {
+    param($value)
+    if ($null -eq $value) { return "" }
+    $text = ([string]$value).Trim()
+    $numeric = 0.0
+    if ($text.EndsWith(".0") -and [double]::TryParse($text, [ref]$numeric)) {
+        if ($numeric -eq [Math]::Floor($numeric)) {
+            $text = [string][int64]$numeric
+        }
+    }
+    return $text
+}
+
 function Start-Processing {
     param($logOutput)
 
@@ -54,11 +67,11 @@ function Start-Processing {
         $firstOrderRow = $usedOrder.Row
         $lastOrderRow = $usedOrder.Row + $usedOrder.Rows.Count - 1
         for ($i = $firstOrderRow; $i -le $lastOrderRow; $i++) {
-            $cellB = [string]$wsOrder.Cells.Item($i, 2).Text
-            $cellC = [string]$wsOrder.Cells.Item($i, 3).Text
-            if ($cellB.Trim() -and $cellC.Trim()) {
-                $article = $cellC.Trim()
-                $internalCode = $cellB.Trim()
+            $cellB = Get-NormalizedArticle $wsOrder.Cells.Item($i, 2).Value2
+            $cellC = Get-NormalizedArticle $wsOrder.Cells.Item($i, 3).Value2
+            if ($cellB -and $cellC) {
+                $article = $cellC
+                $internalCode = $cellB
                 if ($artMap.ContainsKey($article) -and $artMap[$article] -ne $internalCode) {
                     $duplicates[$article] = $true
                     $artMap.Remove($article)
@@ -66,9 +79,14 @@ function Start-Processing {
                     $artMap[$article] = $internalCode
                 }
             }
-            if ($cellB -like "*Заказ №*") { $orderNumber = [string]$wsOrder.Cells.Item($i, 3).Text }
+            if ($cellB -like "*Заказ №*") { $orderNumber = $cellC }
         }
         $wbOrder.Close($false)
+        $wbOrder = $null
+        if (-not $orderNumber) {
+            [System.Windows.Forms.MessageBox]::Show("Номер заказа не найден в файле. Обработка остановлена.", "Ошибка", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            return
+        }
         $logOutput.AppendText("Загружено артикулов: $($artMap.Count). Номер заказа: $orderNumber`r`n")
         foreach ($article in $duplicates.Keys) {
             $logOutput.AppendText("[ДУБЛИКАТ] Артикул '$article' имеет неоднозначное соответствие.`r`n")
@@ -83,7 +101,7 @@ function Start-Processing {
         $lastUpdRow = $usedUpd.Row + $usedUpd.Rows.Count - 1
         $preview = @()
         for ($j = $firstUpdRow; $j -le $lastUpdRow; $j++) {
-            $currentArt = [string]$wsUpd.Cells.Item($j, 2).Text.Trim()
+            $currentArt = Get-NormalizedArticle $wsUpd.Cells.Item($j, 2).Value2
             if (-not $currentArt) { continue }
 
             if ($artMap.ContainsKey($currentArt)) {
@@ -118,16 +136,56 @@ function Start-Processing {
             $logOutput.AppendText("[OK] Строка $($change.Row): заменён артикул '$($change.OldArticle)' на '$($change.NewArticle)'`r`n")
         }
 
-        # Запись номера заказа
-        $foundBase = $wsUpd.Cells.Find("Основание передачи")
+        # Явный поиск единственного поля "Основание передачи"
+        $foundBase = $wsUpd.Cells.Find(
+            "Основание передачи",
+            $null,
+            -4163,
+            1,
+            1,
+            1,
+            $true,
+            $null,
+            $false
+        )
+        $basisMatches = @()
         if ($foundBase) {
-            $wsUpd.Cells.Item($foundBase.Row - 1, 20).Value2 = $orderNumber
-            $logOutput.AppendText("Номер заказа вписан в строку $($foundBase.Row - 1).`r`n")
+            $basisMatches += $foundBase
+            $firstAddress = $foundBase.Address($false, $false)
+            do {
+                $foundBase = $wsUpd.Cells.FindNext($foundBase)
+                if (-not $foundBase) { break }
+                if ($foundBase.Address($false, $false) -eq $firstAddress) { break }
+                $basisMatches += $foundBase
+            } while ($true)
+        }
+        if ($basisMatches.Count -eq 0) {
+            [System.Windows.Forms.MessageBox]::Show('Поле "Основание передачи" не найдено. Обработка остановлена.', "Ошибка", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            $wbUpd.Close($false)
+            $wbUpd = $null
+            return
+        }
+        if ($basisMatches.Count -gt 1) {
+            [System.Windows.Forms.MessageBox]::Show("Найдено несколько полей `"Основание передачи`". Обработка остановлена.", "Ошибка", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            $wbUpd.Close($false)
+            $wbUpd = $null
+            return
+        }
+
+        $targetRow = $basisMatches[0].Row - 1
+        if ($targetRow -gt 0) {
+            $wsUpd.Cells.Item($targetRow, 20).Value2 = $orderNumber
+            $logOutput.AppendText("Номер заказа вписан в строку $targetRow.`r`n")
         }
 
         $directory = [IO.Path]::GetDirectoryName($global:pathUpd)
         $name = [IO.Path]::GetFileNameWithoutExtension($global:pathUpd)
         $outputPath = Join-Path $directory ($name + "_reconciled.xlsx")
+        $counter = 1
+        while (Test-Path -LiteralPath $outputPath) {
+            $outputPath = Join-Path $directory (($name + "_reconciled_" + $counter) + ".xlsx")
+            $counter++
+        }
         $wbUpd.SaveAs($outputPath, 51)
         $wbUpd.Close($true)
         $wbUpd = $null
@@ -183,7 +241,7 @@ $txtLog.ReadOnly = $true
 # События кнопок
 $btnOrder.Add_Click({
     $fd = New-Object System.Windows.Forms.OpenFileDialog
-    $fd.Filter = "Excel Files (*.xlsx; *.xls)|*.xlsx;*.xls"
+    $fd.Filter = "Excel Files (*.xlsx)|*.xlsx"
     if ($fd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { 
         $global:pathOrder = $fd.FileName 
         $btnOrder.Text = "Заказ: " + $fd.SafeFileName 
@@ -192,7 +250,7 @@ $btnOrder.Add_Click({
 
 $btnUpd.Add_Click({
     $fd = New-Object System.Windows.Forms.OpenFileDialog
-    $fd.Filter = "Excel Files (*.xlsx; *.xls)|*.xlsx;*.xls"
+    $fd.Filter = "Excel Files (*.xlsx)|*.xlsx"
     if ($fd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { 
         $global:pathUpd = $fd.FileName 
         $btnUpd.Text = "УПД: " + $fd.SafeFileName 
