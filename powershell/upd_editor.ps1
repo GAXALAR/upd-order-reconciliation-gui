@@ -6,16 +6,28 @@ $global:pathOrder = ""
 $global:pathUpd = ""
 
 function Get-NormalizedArticle {
-    param($value)
+    param($value, $numberFormat)
     if ($null -eq $value) { return "" }
-    $text = ([string]$value).Trim()
-    $numeric = 0.0
-    if ($text.EndsWith(".0") -and [double]::TryParse($text, [ref]$numeric)) {
+    if ($value -is [string]) { return $value.Trim() }
+
+    $isNumeric = $value -is [byte] -or $value -is [int16] -or
+        $value -is [int32] -or $value -is [int64] -or
+        $value -is [single] -or $value -is [double] -or $value -is [decimal]
+    if ($isNumeric) {
+        $text = [Convert]::ToString($value, [Globalization.CultureInfo]::InvariantCulture)
+        $numeric = [double]$value
         if ($numeric -eq [Math]::Floor($numeric)) {
-            $text = [string][int64]$numeric
+            $text = ([decimal]$value).ToString("0", [Globalization.CultureInfo]::InvariantCulture)
+            if ($numberFormat -is [string] -and $numberFormat -match '^0+$') {
+                $negative = $text.StartsWith("-")
+                $digits = if ($negative) { $text.Substring(1) } else { $text }
+                $digits = $digits.PadLeft($numberFormat.Length, '0')
+                if ($negative) { $text = "-" + $digits } else { $text = $digits }
+            }
         }
+        return $text
     }
-    return $text
+    return ([string]$value).Trim()
 }
 
 function Start-Processing {
@@ -40,15 +52,32 @@ function Start-Processing {
     }
 
     $excel = $null
+    $workbooks = $null
     $wbOrder = $null
+    $wbOrderClosed = $false
+    $orderSheets = $null
     $wsOrder = $null
+    $orderCells = $null
     $wbUpd = $null
+    $wbUpdClosed = $false
+    $updSheets = $null
     $wsUpd = $null
+    $updCells = $null
+    $usedOrder = $null
+    $usedUpd = $null
+    $foundBase = $null
+    $findAfterCell = $null
+    $basisMatches = @()
     try {
         $excel = New-Object -ComObject Excel.Application
         $excel.Visible = $false
         $excel.DisplayAlerts = $false
+        $workbooks = $excel.Workbooks
     } catch {
+        if ($excel) {
+            try { $excel.Quit() } catch {}
+            try { [System.Runtime.Interopservices.Marshal]::FinalReleaseComObject($excel) | Out-Null } catch {}
+        }
         [System.Windows.Forms.MessageBox]::Show("Не удалось запустить MS Excel. Убедитесь, что Excel установлен на компьютере.", "Ошибка COM-объекта")
         return
     }
@@ -57,8 +86,10 @@ function Start-Processing {
         $logOutput.AppendText("--- Старт обработки: $(Get-Date -Format 'HH:mm:ss') ---`r`n")
         
         # Загрузка заказа
-        $wbOrder = $excel.Workbooks.Open($global:pathOrder)
-        $wsOrder = $wbOrder.Sheets.Item(1)
+        $wbOrder = $workbooks.Open($global:pathOrder)
+        $orderSheets = $wbOrder.Sheets
+        $wsOrder = $orderSheets.Item(1)
+        $orderCells = $wsOrder.Cells
         $artMap = @{}
         $duplicates = @{}
         $orderNumber = ""
@@ -67,8 +98,15 @@ function Start-Processing {
         $firstOrderRow = $usedOrder.Row
         $lastOrderRow = $usedOrder.Row + $usedOrder.Rows.Count - 1
         for ($i = $firstOrderRow; $i -le $lastOrderRow; $i++) {
-            $cellB = Get-NormalizedArticle $wsOrder.Cells.Item($i, 2).Value2
-            $cellC = Get-NormalizedArticle $wsOrder.Cells.Item($i, 3).Value2
+            $orderCodeCell = $orderCells.Item($i, 2)
+            $orderArticleCell = $orderCells.Item($i, 3)
+            try {
+                $cellB = Get-NormalizedArticle $orderCodeCell.Value2 $orderCodeCell.NumberFormat
+                $cellC = Get-NormalizedArticle $orderArticleCell.Value2 $orderArticleCell.NumberFormat
+            } finally {
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($orderCodeCell) | Out-Null
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($orderArticleCell) | Out-Null
+            }
             if ($cellB -and $cellC) {
                 $article = $cellC
                 $internalCode = $cellB
@@ -82,7 +120,7 @@ function Start-Processing {
             if ($cellB -like "*Заказ №*") { $orderNumber = $cellC }
         }
         $wbOrder.Close($false)
-        $wbOrder = $null
+        $wbOrderClosed = $true
         if (-not $orderNumber) {
             [System.Windows.Forms.MessageBox]::Show("Номер заказа не найден в файле. Обработка остановлена.", "Ошибка", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
             return
@@ -93,15 +131,22 @@ function Start-Processing {
         }
 
         # Обработка УПД
-        $wbUpd = $excel.Workbooks.Open($global:pathUpd)
-        $wsUpd = $wbUpd.Sheets.Item(1)
+        $wbUpd = $workbooks.Open($global:pathUpd)
+        $updSheets = $wbUpd.Sheets
+        $wsUpd = $updSheets.Item(1)
+        $updCells = $wsUpd.Cells
 
         $usedUpd = $wsUpd.UsedRange
         $firstUpdRow = [Math]::Max(17, $usedUpd.Row)
         $lastUpdRow = $usedUpd.Row + $usedUpd.Rows.Count - 1
         $preview = @()
         for ($j = $firstUpdRow; $j -le $lastUpdRow; $j++) {
-            $currentArt = Get-NormalizedArticle $wsUpd.Cells.Item($j, 2).Value2
+            $updArticleCell = $updCells.Item($j, 2)
+            try {
+                $currentArt = Get-NormalizedArticle $updArticleCell.Value2 $updArticleCell.NumberFormat
+            } finally {
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($updArticleCell) | Out-Null
+            }
             if (-not $currentArt) { continue }
 
             if ($artMap.ContainsKey($currentArt)) {
@@ -118,7 +163,7 @@ function Start-Processing {
         if ($preview.Count -eq 0) {
             [System.Windows.Forms.MessageBox]::Show("Не найдено ни одного однозначного артикула для замены.", "Предпросмотр", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
             $wbUpd.Close($false)
-            $wbUpd = $null
+            $wbUpdClosed = $true
             return
         }
 
@@ -127,56 +172,76 @@ function Start-Processing {
         if ($confirmation -ne [System.Windows.Forms.DialogResult]::Yes) {
             $logOutput.AppendText("Операция отменена пользователем.`r`n")
             $wbUpd.Close($false)
-            $wbUpd = $null
+            $wbUpdClosed = $true
             return
         }
 
         foreach ($change in $preview) {
-            $wsUpd.Cells.Item($change.Row, 2).Value2 = $change.NewArticle
+            $changeCell = $updCells.Item($change.Row, 2)
+            try {
+                $changeCell.Value2 = $change.NewArticle
+            } finally {
+                [System.Runtime.Interopservices.Marshal]::ReleaseComObject($changeCell) | Out-Null
+            }
             $logOutput.AppendText("[OK] Строка $($change.Row): заменён артикул '$($change.OldArticle)' на '$($change.NewArticle)'`r`n")
         }
 
         # Явный поиск единственного поля "Основание передачи"
-        $foundBase = $wsUpd.Cells.Find(
-            "Основание передачи",
-            $null,
-            -4163,
-            1,
-            1,
-            1,
-            $true,
-            $null,
-            $false
-        )
-        $basisMatches = @()
+        $findAfterCell = $updCells.Item(1, 1)
+        try {
+            $foundBase = $updCells.Find(
+                "Основание передачи",
+                $findAfterCell,
+                -4163,
+                1,
+                1,
+                1,
+                $true,
+                $false,
+                $false
+            )
+        } finally {
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($findAfterCell) | Out-Null
+            $findAfterCell = $null
+        }
         if ($foundBase) {
             $basisMatches += $foundBase
             $firstAddress = $foundBase.Address($false, $false)
             do {
-                $foundBase = $wsUpd.Cells.FindNext($foundBase)
+                $foundBase = $updCells.FindNext($foundBase)
                 if (-not $foundBase) { break }
                 if ($foundBase.Address($false, $false) -eq $firstAddress) { break }
                 $basisMatches += $foundBase
             } while ($true)
         }
+        $foundBase = $null
         if ($basisMatches.Count -eq 0) {
             [System.Windows.Forms.MessageBox]::Show('Поле "Основание передачи" не найдено. Обработка остановлена.', "Ошибка", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
             $wbUpd.Close($false)
-            $wbUpd = $null
+            $wbUpdClosed = $true
             return
         }
         if ($basisMatches.Count -gt 1) {
             [System.Windows.Forms.MessageBox]::Show("Найдено несколько полей `"Основание передачи`". Обработка остановлена.", "Ошибка", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
             $wbUpd.Close($false)
-            $wbUpd = $null
+            $wbUpdClosed = $true
             return
         }
 
         $targetRow = $basisMatches[0].Row - 1
-        if ($targetRow -gt 0) {
-            $wsUpd.Cells.Item($targetRow, 20).Value2 = $orderNumber
-            $logOutput.AppendText("Номер заказа вписан в строку $targetRow.`r`n")
+        if ($targetRow -le 0) {
+            [System.Windows.Forms.MessageBox]::Show('Поле "Основание передачи" находится в первой строке; невозможно определить строку для номера заказа.', "Ошибка", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+            $wbUpd.Close($false)
+            $wbUpdClosed = $true
+            return
         }
+        $targetCell = $updCells.Item($targetRow, 20)
+        try {
+            $targetCell.Value2 = $orderNumber
+        } finally {
+            [System.Runtime.Interopservices.Marshal]::ReleaseComObject($targetCell) | Out-Null
+        }
+        $logOutput.AppendText("Номер заказа вписан в строку $targetRow.`r`n")
 
         $directory = [IO.Path]::GetDirectoryName($global:pathUpd)
         $name = [IO.Path]::GetFileNameWithoutExtension($global:pathUpd)
@@ -188,7 +253,7 @@ function Start-Processing {
         }
         $wbUpd.SaveAs($outputPath, 51)
         $wbUpd.Close($true)
-        $wbUpd = $null
+        $wbUpdClosed = $true
         $logOutput.AppendText("--- Успешно завершено! ---`r`n")
         [System.Windows.Forms.MessageBox]::Show("Обработка завершена успешно!`r`nФайл сохранён:`r`n$outputPath", "Успех", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Information)
 
@@ -196,14 +261,15 @@ function Start-Processing {
         $logOutput.AppendText("ОШИБКА: $($_.Exception.Message)`r`n")
         [System.Windows.Forms.MessageBox]::Show("Произошла ошибка:`r`n$($_.Exception.Message)", "Ошибка", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
     } finally {
-        if ($wbUpd) { try { $wbUpd.Close($false) } catch {} }
-        if ($wbOrder) { try { $wbOrder.Close($false) } catch {} }
-        foreach ($object in @($wsUpd, $wsOrder, $wbUpd, $wbOrder, $excel)) {
+        if ($wbUpd -and -not $wbUpdClosed) { try { $wbUpd.Close($false) } catch {} }
+        if ($wbOrder -and -not $wbOrderClosed) { try { $wbOrder.Close($false) } catch {} }
+        foreach ($object in @($basisMatches) + @($findAfterCell, $foundBase, $usedUpd, $usedOrder, $updCells, $orderCells, $wsUpd, $wsOrder, $updSheets, $orderSheets, $wbUpd, $wbOrder, $workbooks)) {
             if ($null -ne $object) {
                 try { [System.Runtime.Interopservices.Marshal]::FinalReleaseComObject($object) | Out-Null } catch {}
             }
         }
         if ($excel) { try { $excel.Quit() } catch {} }
+        if ($excel) { try { [System.Runtime.Interopservices.Marshal]::FinalReleaseComObject($excel) | Out-Null } catch {} }
         [System.GC]::Collect()
         [System.GC]::WaitForPendingFinalizers()
     }

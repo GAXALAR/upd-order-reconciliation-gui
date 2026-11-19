@@ -37,18 +37,21 @@ class UPDReconcilerApp:
         self.root.update()
 
     @staticmethod
-    def normalize_article(value):
+    def normalize_article(value, number_format="General"):
         if value is None:
             return ""
-        text = str(value).strip()
-        if text.endswith(".0"):
-            try:
-                numeric = float(text)
-                if numeric.is_integer():
-                    text = str(int(numeric))
-            except (TypeError, ValueError, OverflowError):
-                pass
-        return text
+        if isinstance(value, bool):
+            return str(value).strip()
+        if isinstance(value, (int, float)):
+            if isinstance(value, float) and not value.is_integer():
+                return str(value).strip()
+            text = str(int(value))
+            if isinstance(number_format, str) and number_format and set(number_format) == {"0"}:
+                sign = "-" if text.startswith("-") else ""
+                digits = text[1:] if sign else text
+                return sign + digits.zfill(len(number_format))
+            return text
+        return str(value).strip()
 
     @staticmethod
     def unique_output_path(source):
@@ -107,8 +110,14 @@ class UPDReconcilerApp:
             order_number = ""
 
             for row_idx in range(1, ws_order.max_row + 1):
-                cell_b = self.normalize_article(ws_order.cell(row=row_idx, column=2).value)
-                cell_c = self.normalize_article(ws_order.cell(row=row_idx, column=3).value)
+                order_code_cell = ws_order.cell(row=row_idx, column=2)
+                order_article_cell = ws_order.cell(row=row_idx, column=3)
+                cell_b = self.normalize_article(
+                    order_code_cell.value, order_code_cell.number_format
+                )
+                cell_c = self.normalize_article(
+                    order_article_cell.value, order_article_cell.number_format
+                )
 
                 if cell_b and cell_c:
                     if cell_c in art_map and art_map[cell_c] != cell_b:
@@ -140,8 +149,9 @@ class UPDReconcilerApp:
 
             # Замена артикулов начиная с 17 строки (Колонка B - это индекс 2 в openpyxl)
             for row_idx in range(17, ws_upd.max_row + 1):
+                article_cell = ws_upd.cell(row=row_idx, column=2)
                 current_art = self.normalize_article(
-                    ws_upd.cell(row=row_idx, column=2).value
+                    article_cell.value, article_cell.number_format
                 )
                 if not current_art:
                     continue
@@ -192,9 +202,15 @@ class UPDReconcilerApp:
                 return
 
             target_row = basis_matches[0].row - 1
-            if target_row > 0:
-                ws_upd.cell(row=target_row, column=20).value = order_number
-                self.log(f"Номер заказа успешно вписан в строку {target_row}.")
+            if target_row <= 0:
+                messagebox.showerror(
+                    "Ошибка",
+                    'Поле "Основание передачи" находится в первой строке; '
+                    "невозможно определить строку для номера заказа."
+                )
+                return
+            ws_upd.cell(row=target_row, column=20).value = order_number
+            self.log(f"Номер заказа успешно вписан в строку {target_row}.")
 
             # 3. Сохранение
             output_path = self.unique_output_path(upd_path)
